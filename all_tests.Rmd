@@ -1,0 +1,222 @@
+---
+title: ''
+output:
+  html_document:
+    toc: true
+    theme: united
+    code_folding: hide
+---
+
+```{r}
+library(data.table)
+library(doParallel)
+
+#global var.
+data = fread("./Final_8060_Gxe_Dataset.csv")
+data[, BMI_Cat2 := as.factor(BMI_Cat2), ]
+data[, lowed := as.factor(lowed), ]
+data[, Income := as.factor(Income), ]
+data[, WGHTS_PROV_COM := as.factor(WGHTS_PROV_COM), ]
+data[, chromosomal.sex := as.factor(chromosomal.sex), ]
+
+#matrix to hold permuted data 
+nreps = 1000
+outcome_mx = replicate(nreps, data[, sample(IOP_adj), ])
+
+#matrix to hold pvalues from permutations
+ntest = 32
+pval_mx = matrix(0, nrow = nreps, ncol = ntest)
+
+
+#--- functions for running LM and then doing LRT for interaction term
+#---- and permutation
+run_lm_lrt <- function(v1, v2, cov_cols){
+  cov_cols = cov_cols[cov_cols != v1]
+  lm1 <- paste(cov_cols, collapse = " + ")
+  lm1 <- paste("IOP_adj ~ ", lm1, v1, v2, sep=" + ")
+  lm2 <- paste0(lm1, " + ", paste0(v1, "*", v2))
+  lm1 <- lm(as.formula(lm1), data = data)
+  lm2 <- lm(as.formula(lm2), data = data)
+  return(anova(lm1, lm2, test="LRT")$`Pr(>Chi)`[2])
+}
+
+run_lm_lrt_permuted <- function(v1, v2, cov_cols){
+  cov_cols = cov_cols[cov_cols != v1]
+  # rm.na = data[ , !is.na(v1) & !is.na(v2) , env = list(v1=v1, v2=v2)]
+  rm.na = !is.na(data[[v1]]) & !is.na(data[[v2]])
+  
+  lm1 <- paste(cov_cols, collapse = " + ")
+  lm1 <- paste("x ~ ", lm1, v1, v2, sep=" + ")
+  lm2 <- paste0(lm1, " + ", paste0(v1, "*", v2))
+  apply(outcome_mx[rm.na, ], 2, 
+        run_lm_lrt_permuted2, formula1 = lm1, formula2 = lm2, 
+        data = data[rm.na, ])
+}
+
+run_lm_lrt_permuted2 <- function(x, formula1, formula2, data){
+  lm1 = lm(as.formula(formula1), data=data)
+  lm2 = lm(as.formula(formula2), data=data)
+  return(anova(lm1, lm2, test="LRT")$`Pr(>Chi)`[2])
+}
+
+
+#--- functions for westfall stepdown procedure
+#compare each element to next, last element is same
+#pmax/pmin are element wise comparison for 2 vectors
+successive_max = function(vec){
+  return(pmax(vec, vec[c(1, 1:(length(vec)-1) )] ))
+}
+
+successive_min = function(vec){
+  return(pmin(vec, vec[c(2:length(vec), length(vec))]) )
+}
+
+#input a vector of real pvalues, and a matrix with ncol = length of the vector
+# each column are the permuted values for the respective test in the vector
+# vector and matrix need to be in same order
+adjust_westfall = function(real_pvalues, pval_mx){
+  # #get order of p-values ascending (same as test. stat descending)
+  ranks = order(real_pvalues)
+  
+  # reorder the matrix of permuted values to be in order of the real pvalue
+  pval_mx = pval_mx[, ranks]
+  #for each permutation get the successive min of p-values
+  stepdown_mx = apply(pval_mx, 1, successive_min)
+  
+  #the matrix > vector operation works by flattening the matrix (by column),
+  # and then repeating the vector to same length and doing elementwise comparison.
+  #  if nrow(matrix) = length(vector) then it is same result as broadcasting over rows
+  adjusted_pval =  stepdown_mx <= real_pvalues[order(real_pvalues)]
+  adjusted_pval = apply(adjusted_pval, 1, mean)
+  #enforce monotonicity (the adjusted pval are still in ascending order of the original)
+  adjusted_pval = successive_max(adjusted_pval)
+  #put the adjusted pvalues back in the original order (not ranked)
+  adjusted_pval = adjusted_pval[rank(real_pvalues)]
+  return(adjusted_pval)
+}
+```
+
+```{r}
+#specify covariates and predictors
+cov = c("AGE_NMBR_COM", "chromosomal.sex", "lowed", "Income", "WGHTS_PROV_COM", "BMI_Cat2", "Hyper", "Diab", "total_energy", "newsmoke", "altalc" )
+cov1 = c(cov, paste0("PC", 1:10))
+env = c("total_frut", "gen_veg", "altalc", "newsmoke")
+snp = c("chr22.19963748.G.A_G", "chr22.19953481.A.G_A", "chr16.30374516.T.C_T", "chr16.30343759.C.T_T", "chr22.19959676.CTCT.C_C", "chr10.87718088.G.A_A")
+metab = c("omet_standard", "ascorbic_standard")
+
+env1   = rep(env, each=6)
+snp_   = rep(snp, 4)
+env2   = rep(env, each=2)
+metab_ = rep(metab, 4)
+
+#--- do lrt with smoking and alcohol as categorical variables
+data[, altalc := as.factor(altalc), ]
+data[, newsmoke := as.factor(newsmoke), ]
+
+#run lm lrt for GxE tests
+lmlrt = mapply(run_lm_lrt, v1=env1, v2=snp_, 
+            MoreArgs = list(cov_cols = cov1))
+#run lm lrt for MxE tests
+lmlrt2 = mapply(run_lm_lrt, v1=env2, v2=metab_,
+             MoreArgs = list(cov_cols = c(cov, "BLD_FD24_HR_COM")))
+
+lmlrt = c(lmlrt, lmlrt2)
+
+#--- run the permutation tests in parallel
+registerDoParallel(10)
+pval_mx[ , 1:24]  = foreach(i=1:24, .inorder = TRUE, .combine = "cbind") %dopar% 
+  run_lm_lrt_permuted(env1[i], snp_[i], cov1)
+
+pval_mx[ , 25:32] = foreach(i=1:8, .inorder = TRUE, .combine = "cbind") %dopar%
+  run_lm_lrt_permuted(env2[i], metab_[i], c(cov, "BLD_FD24_HR_COM"))
+
+
+#--- stepdown procedure on permuted pvals
+adjusted_pval = adjust_westfall(lmlrt, pval_mx)
+df = cbind(LRT_pval = lmlrt, LRT_adjust = adjusted_pval)
+rownames(df) = c( paste0(env1, " * ", snp_),
+                  paste0(env2, " * ", metab_) )
+
+save(df, file="all_tests.Rdata")
+```
+
+```{r, warning = FALSE, message=FALSE}
+library(kableExtra)
+
+load("./all_tests.Rdata")
+#--- print result table
+highlight = which(df[, "LRT_pval"] < 0.05 )
+
+kable(df, digits = 6) %>%
+  kable_paper("hover", full_width = F) %>%
+  row_spec(highlight, background = "#ADD8E6") 
+  
+```
+
+```{r, include=FALSE}
+# #run lm for GxE tests
+# df = mapply(run_lm, v1=env1, v2=snp_, 
+#             MoreArgs = list(cov_cols = cov))
+# #run lm for MxE tests
+# df2 = mapply(run_lm, v1=env2, v2=metab_,
+#              MoreArgs = list(cov_cols = c(cov, "BLD_FD24_HR_COM")))
+# 
+# colnames(df) = paste0(env1, " * ", snp_)
+# colnames(df2) = paste0(env2, " * ", metab_)
+# df = cbind(df, df2)
+# df = t(df)
+
+#--- run the permutation tests in parallel
+
+# #Gxe
+# pval_mx[ , 1:24]  = foreach(i=1:24, .inorder = TRUE, .combine = "cbind") %dopar% 
+#   run_lm_permuted(env1[i], snp_[i], cov1)
+# 
+# #MxE
+# pval_mx[ , 25:32] = foreach(i=1:8, .inorder = TRUE, .combine = "cbind") %dopar%
+#   run_lm_permuted(env2[i], metab_[i], c(cov, "BLD_FD24_HR_COM"))
+# 
+# colnames(pval_mx) = c(paste0(env1, " * ", snp_), 
+#                       paste0(env2, " * ", metab_))
+
+# #--- stepdown procedure on permuted pvals
+# adjusted_pval = adjust_westfall(df[, "Pr(>|t|)"], pval_mx)
+# df = cbind(df, adjusted = adjusted_pval)
+
+#--- print result table
+# highlight = which(df[, "LRT_pval"] < 0.05 | df[, "Pr(>|t|)"] < 0.05)
+# 
+# kable(df, digits = 6) %>%
+#   kable_paper("hover", full_width = F) %>%
+#   add_header_above(c(" "=1, "alc/smoke continuous" = 5, "alc/smoke categorical"=2)) %>%
+#   row_spec(highlight, background = "#ADD8E6") %>%
+#   column_spec(6, border_right = TRUE)
+
+# #--- functions for running LM and taking coeff. of interaction term
+# #---- also for running the permutations
+# run_lm <- function(v1, v2, cov_cols){
+#   cov_cols = cov_cols[cov_cols != v1]
+#   lm_ <- paste(cov_cols, collapse = " + ")
+#   lm_ <- paste("IOP_adj ~ ", lm_, v1, v2, sep=" + ")
+#   lm_ <- paste0(lm_, " + ", paste0(v1, "*", v2))
+#   lm_ <- lm(as.formula(lm_), data = data)
+#   return(summary(lm_)$coefficients[ paste0(v1, ":", v2), ])
+# }
+# 
+# run_lm_permuted <- function(v1, v2, cov_cols){
+#   cov_cols = cov_cols[cov_cols != v1]
+#   lm_ <- paste(cov_cols, collapse = " + ")
+#   lm_ <- paste("x ~ ", lm_, v1, v2, sep=" + ")
+#   lm_ <- paste0(lm_, " + ", paste0(v1, "*", v2))
+#   # pval_mx[, paste0(v1, " * ", v2) ] <<- 
+#   apply(outcome_mx, 2, 
+#         run_lm_permuted2, formula = lm_, 
+#         term = paste0(v1, ":", v2))
+# }
+# 
+# run_lm_permuted2 <- function(x, formula, term){
+#   lm_ = lm(as.formula(formula), data=data)
+#   return(summary(lm_)$coefficients[term, "Pr(>|t|)"])  
+# }
+```
+
